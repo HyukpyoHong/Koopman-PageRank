@@ -20,6 +20,11 @@ import networkx as nx
 from scipy.linalg import subspace_angles
 from scipy.integrate import solve_ivp
 
+try:
+    from .pagerank_utils import prune_zero_rows, retained_preference, expand_scores
+except ImportError:  # Direct imports from the notebooks' src path.
+    from pagerank_utils import prune_zero_rows, retained_preference, expand_scores
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 1.  Dynamical systems
@@ -316,21 +321,23 @@ def pagerank(M, num_iterations=100_000, d=0.8):
 
     Returns
     -------
-    v : (N,) PageRank score vector (sums to 1)
+    v : (N,) PageRank scores in original indexing (removed nodes score zero).
+        Zero-outgoing nodes and their incident edges are pruned iteratively.
+        Use prune_zero_rows(M.T)[1] to obtain the retained original indices.
     """
-    N = M.shape[1]
-    out_degree = np.sum(M, axis=0)
-    out_degree[out_degree == 0] = 1.0
-    M_hat = M / out_degree
+    original_size = M.shape[1]
+    P, retained = prune_zero_rows(np.asarray(M).T)
+    M_hat = P.T
+    N = len(retained)
 
     v = np.ones(N) / N
     p = np.ones(N) / N
     for _ in range(num_iterations):
         v_next = (1 - d) * p + d * M_hat.dot(v)
         if np.allclose(v, v_next, atol=1e-10):
-            return v_next
+            return expand_scores(v_next, retained, original_size)
         v = v_next
-    return v
+    return expand_scores(v, retained, original_size)
 
 
 def personalized_pagerank(M, num_iterations=100_000, d=0.8, seed_nodes=None):
@@ -346,34 +353,31 @@ def personalized_pagerank(M, num_iterations=100_000, d=0.8, seed_nodes=None):
 
     Returns
     -------
-    v : (N,) PPR score vector
+    v : (N,) PPR scores in original indexing; removed nodes score zero.
+        Seeds removed by iterative zero-outgoing pruning raise ValueError.
     """
-    N = M.shape[1]
-    p = np.zeros(N)
-    if seed_nodes:
-        for s in seed_nodes:
-            p[s] = 1.0 / len(seed_nodes)
-    else:
-        p = np.ones(N) / N
-
-    out_degree = np.sum(M, axis=0)
-    out_degree[out_degree == 0] = 1.0
-    M_hat = M / out_degree
+    original_size = M.shape[1]
+    P, retained = prune_zero_rows(np.asarray(M).T)
+    N = len(retained)
+    p = retained_preference(retained, original_size, seed_nodes)
+    M_hat = P.T
 
     v = np.ones(N) / N
     for _ in range(num_iterations):
         v_next = (1 - d) * p + d * M_hat.dot(v)
         if np.allclose(v, v_next, atol=1e-10):
-            return v_next
+            return expand_scores(v_next, retained, original_size)
         v = v_next
-    return v
+    return expand_scores(v, retained, original_size)
 
 
 def subsampled_pagerank(M, num_iterations=100, d=0.85,
                         subsample_rate=0.1, epsilon=1e-8):
     """Stochastic PageRank with column sub-sampling (large-N approximation)."""
-    N = M.shape[0]
-    M_hat = M / M.sum(axis=0)
+    original_size = M.shape[0]
+    P, retained = prune_zero_rows(np.asarray(M).T)
+    N = len(retained)
+    M_hat = P.T
     v = np.ones(N) / N
     for _ in range(num_iterations):
         v_prev = v.copy()
@@ -382,7 +386,7 @@ def subsampled_pagerank(M, num_iterations=100, d=0.85,
              + d * M_hat[:, mask] @ (v_prev[mask] / subsample_rate))
         if np.abs(v - v_prev).sum() < epsilon:
             break
-    return v / v.sum()
+    return expand_scores(v / v.sum(), retained, original_size)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -426,7 +430,9 @@ def compute_orderings(K_full, N, d, default_basis, Psi_X, Psi_Y):
     -------
     dict with keys 'Unordered', 'Incremental', 'PageRank', 'PPR'
     """
-    other_basis = np.setdiff1d(range(N), default_basis)
+    _, retained = prune_zero_rows(np.asarray(np.abs(K_full)).T)
+    retained_preference(retained, N, default_basis)  # Reject removed targets.
+    other_basis = np.setdiff1d(retained, default_basis)
 
     # Unordered: random permutation of non-default observables
     random_idx = np.append(
@@ -437,7 +443,7 @@ def compute_orderings(K_full, N, d, default_basis, Psi_X, Psi_Y):
     inc_idx = np.append(default_basis, other_basis).astype(int)
 
     # PageRank
-    eig_v = pagerank(np.abs(K_full), 100_000, 0.8)
+    eig_v = pagerank(np.abs(K_full), 100_000, 0.85)
     ranked_idx = np.append(
         default_basis,
         other_basis[np.argsort(eig_v[other_basis])[::-1]]
@@ -445,7 +451,7 @@ def compute_orderings(K_full, N, d, default_basis, Psi_X, Psi_Y):
 
     # PPR (seeds = all coordinate functions)
     ppr_v = personalized_pagerank(
-        np.abs(K_full), 100_000, 0.8, seed_nodes=list(default_basis)
+        np.abs(K_full), 100_000, 0.85, seed_nodes=list(default_basis)
     )
     ppr_idx = np.append(
         default_basis,
@@ -480,7 +486,7 @@ def compute_errors(methods, Psi_X, Psi_Y, Psi_X_test, Psi_Y_test,
     errors = {}
     for name, ordering in methods.items():
         err = np.full(N, np.nan)
-        for nr in range(d, N + 1):
+        for nr in range(d, min(N, len(ordering)) + 1):
             sel = ordering[:nr].astype(int)
             K_sub = find_best_lin(Psi_X[:, sel], Psi_Y[:, sel])
             pred = Psi_X_test[:, sel] @ K_sub
@@ -755,7 +761,7 @@ def build_delay_embedding(DATA, M, N_delay, h):
 
 
 def select_top_indices(rank_vector, coord_indices, N_delay, N_select,
-                       group_by_delay=True):
+                       group_by_delay=True, retained_indices=None):
     """Select top-N_select observable indices from a rank vector.
 
     Parameters
@@ -765,14 +771,21 @@ def select_top_indices(rank_vector, coord_indices, N_delay, N_select,
     N_delay       : total number of delay levels
     N_select      : total number of observables to return
     group_by_delay: if True, x/y/z at each delay level are selected together
+    retained_indices: optional original indices surviving zero-row pruning
 
     Returns
     -------
     selected : (N_select,) int array, coord_indices first
     """
     coord_set  = set(coord_indices.tolist())
+    retained = (set(range(len(rank_vector))) if retained_indices is None
+                else set(np.asarray(retained_indices).tolist()))
+    if not coord_set.issubset(retained):
+        raise ValueError("Required coordinate observables were removed by zero-row pruning")
+    if N_select > len(retained):
+        raise ValueError("Requested dictionary size exceeds the retained observable count")
     other_mask = np.array([i for i in range(len(rank_vector))
-                           if i not in coord_set])
+                           if i not in coord_set and i in retained], dtype=int)
     n_extra = max(0, N_select - len(coord_indices))
 
     if not group_by_delay:
@@ -784,8 +797,13 @@ def select_top_indices(rank_vector, coord_indices, N_delay, N_select,
         level_scores  = {}
         for lv in other_levels:
             cols = [d * lv + dim for dim in range(d) if d * lv + dim not in coord_set]
-            if cols:
+            if cols and all(col in retained for col in cols):
                 level_scores[lv] = rank_vector[cols].sum()
+        eligible_count = sum(len([d * lv + dim for dim in range(d)
+                                  if d * lv + dim not in coord_set])
+                             for lv in level_scores)
+        if n_extra > eligible_count:
+            raise ValueError("Requested dictionary size exceeds the complete retained delay groups")
         sorted_levels = sorted(level_scores, key=level_scores.get, reverse=True)
         top_other = []
         for lv in sorted_levels:

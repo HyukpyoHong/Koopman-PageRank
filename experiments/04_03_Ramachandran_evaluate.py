@@ -2,15 +2,25 @@
 Step 3: Comprehensive evaluation and publication-quality figures.
 Aggregates results over 20 independent trajectories to produce error bars.
 """
-import os, numpy as np
+import os, json, hashlib
+from pathlib import Path
+import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 
-OUT = "results/"
-FIG = "figures/"
+OUT = os.environ.get("KOOPMAN_RAMACHANDRAN_RESULTS_DIR", "results_196_train_only/")
+PLOT_N_MAX = int(os.environ.get("KOOPMAN_RAMACHANDRAN_PLOT_N_MAX", "75"))
+if not 4 < PLOT_N_MAX <= 80:
+    raise ValueError("Plot upper bound must be greater than 4 and at most 80")
+PLOT_ONLY = os.environ.get("KOOPMAN_RAMACHANDRAN_PLOT_ONLY", "0") == "1"
+FIG = os.environ.get("KOOPMAN_RAMACHANDRAN_FIGURE_DIR",
+                     f"figures_196_train_only_N{PLOT_N_MAX}/")
+EVALUATION = Path(os.environ.get("KOOPMAN_RAMACHANDRAN_EVALUATION_DIR",
+                                  "../validation/full_evaluation_196_train_only"))
 os.makedirs(FIG, exist_ok=True)
+EVALUATION.mkdir(parents=True, exist_ok=True)
 
 
 plt.rcParams.update({
@@ -41,6 +51,27 @@ n_traj = 20
 # ═══════════════════════════════════════════════════════════════
 # Error functions (operate on arrays passed in, no globals)
 # ═══════════════════════════════════════════════════════════════
+def validate_training_result(result, n_frames):
+    """Reject caches fitted on test data or using a different split."""
+    required = {"evaluation_protocol", "n_train_pairs", "preprocessing_fit_stop",
+                "dictionary_mean", "dictionary_std"}
+    if not required.issubset(result.keys()):
+        raise ValueError("Cache lacks train-only metadata; regenerate Step 2")
+    if str(result["evaluation_protocol"]) != "train_only_v1":
+        raise ValueError("Cache uses a different evaluation protocol; regenerate Step 2")
+    ntr = int(result["n_train_pairs"])
+    if (ntr != int(0.8 * (n_frames - 1)) or not 0 < ntr < n_frames - 1
+            or int(result["preprocessing_fit_stop"]) != ntr + 1):
+        raise ValueError("Cache training split is inconsistent with this trajectory")
+    mean = np.asarray(result["dictionary_mean"])
+    scale = np.asarray(result["dictionary_std"])
+    if (mean.shape != (196,) or scale.shape != (196,)
+            or not np.all(np.isfinite(mean)) or not np.all(np.isfinite(scale))
+            or np.any(scale <= 0)):
+        raise ValueError("Cache dictionary scaling metadata is invalid")
+    return ntr
+
+
 def _solve(idx, Xtr, Ytr, Ytr_si, ntr):
     Xs   = Xtr[idx]
     G    = Xs @ Xs.T / ntr
@@ -52,11 +83,16 @@ def _solve(idx, Xtr, Ytr, Ytr_si, ntr):
     return Ksub, Kread
 
 def err1(order, N, Xtr, Ytr, Ytr_si, Xt, Yt_si, ntr):
+    if N > len(order):
+        return np.nan  # This dictionary size is unavailable after pruning.
     idx = order[:N]
     _, Kread = _solve(idx, Xtr, Ytr, Ytr_si, ntr)
     return np.mean(np.sum((Yt_si - Kread @ Xt[idx])**2, axis=0))
 
 def errM(order, N, Psi, si, steps, ntr):
+    """Score Kread @ Ksub**(h-1) on starts with all requested horizons available."""
+    if N > len(order):
+        return np.full(steps, np.nan)
     idx = order[:N]
     Xtr   = Psi[:ntr].T
     Ytr   = Psi[1:ntr+1].T
@@ -64,14 +100,59 @@ def errM(order, N, Psi, si, steps, ntr):
     Ksub, Kread = _solve(idx, Xtr, Ytr, Ytr_si, ntr)
     st  = ntr
     nt  = Psi.shape[0] - st - steps
-    errs = np.zeros(steps)
-    for t in range(nt):
-        z = Psi[st+t, idx].copy()
-        for s in range(steps):
-            z  = Ksub @ z
-            sp = Kread @ z
-            errs[s] += np.sum((Psi[st+t+s+1, si] - sp)**2)
-    return errs / nt
+    if nt <= 0:
+        raise ValueError("No test starts have all requested horizons available")
+    # Each column is an independent test start; preserve readout-before-propagation.
+    z = Psi[st:st+nt, idx].T.copy()
+    errs = np.empty(steps)
+    for h in range(1, steps + 1):
+        prediction = Kread @ z
+        target = Psi[st+h:st+h+nt][:, si].T
+        errs[h-1] = np.mean(np.sum((target - prediction)**2, axis=0))
+        z = Ksub @ z
+    return errs
+
+
+def one_step_statistics(psi, ntr, si):
+    """Training fit and held-out scoring statistics; no fit uses test data."""
+    x, y = psi[:ntr], psi[1:ntr+1][:, si]
+    xt, yt = psi[ntr:-1], psi[ntr+1:][:, si]
+    return dict(gram=x.T @ x / len(x), cross=y.T @ x / len(x),
+                test_gram=xt.T @ xt / len(xt), test_cross=yt.T @ xt / len(xt),
+                target_sq=float(np.sum(yt * yt) / len(yt)))
+
+
+def one_step_from_statistics(order, n, statistics):
+    """Identical ridge readout/MSE to err1, avoiding repeated sample products."""
+    idx = order[:n]
+    if len(idx) != n:
+        return np.nan
+    g = statistics["gram"][np.ix_(idx, idx)]
+    lam = max(1e-5, 1e-3 * np.linalg.eigvalsh(g).max())
+    readout = statistics["cross"][:, idx] @ np.linalg.inv(g + lam * np.eye(n))
+    gt = statistics["test_gram"][np.ix_(idx, idx)]
+    error = (statistics["target_sq"]
+             - 2 * np.sum(readout * statistics["test_cross"][:, idx])
+             + np.sum((readout @ gt) * readout))
+    if not np.isfinite(error) or error < -1e-10:
+        raise ValueError("Invalid one-step MSE")
+    return float(max(error, 0.))
+
+
+def paired_ratio_summary(method_errors, random_errors):
+    """Empirical mean/std of paired trajectory ratios, plus ratio of means."""
+    ratios = np.asarray(method_errors) / np.asarray(random_errors)
+    return ratios.mean(axis=0), ratios.std(axis=0), (np.mean(method_errors, axis=0)
+                                                     / np.mean(random_errors, axis=0))
+
+
+figure_axes_limits = {}
+
+def save_figure(fig, name):
+    figure_axes_limits[name] = [list(ax.get_xlim()) for ax in fig.axes]
+    fig.savefig(os.path.join(FIG, name + ".pdf"), bbox_inches="tight")
+    fig.savefig(os.path.join(FIG, name + ".png"), dpi=160, bbox_inches="tight")
+    plt.close(fig)
 
 # ═══════════════════════════════════════════════════════════════
 # Aggregate over all trajectories
@@ -86,7 +167,20 @@ rep = None
 Nms   = 15
 steps = 30
 
-for traj_i in range(n_traj):
+if PLOT_ONLY:
+    with np.load(EVALUATION / "trajectory_errors.npz", allow_pickle=False) as cached:
+        if (not np.array_equal(cached["N"], Nr) or int(cached["N_multistep"]) != Nms
+                or not np.array_equal(cached["horizons"], np.arange(1, steps+1))):
+            raise ValueError("Cached evaluation grid differs from the expected full grid")
+        E1_all = {nm: cached["E1_"+nm].copy() for nm in E1_all}
+        EM_all = {nm: cached["EM_"+nm].copy() for nm in EM_all}
+        if any(v.shape != (n_traj, len(Nr)) or not np.all(np.isfinite(v)) for v in E1_all.values()):
+            raise ValueError("Incomplete one-step cache")
+        if any(v.shape != (n_traj, steps) or not np.all(np.isfinite(v)) for v in EM_all.values()):
+            raise ValueError("Incomplete multi-step cache")
+    print("Plot-only: reusing full N=4..80 evaluation; no error arrays will be rewritten", flush=True)
+
+for traj_i in range(1 if PLOT_ONLY else n_traj):
     path = os.path.join(OUT, f"edmd_results_{traj_i:02d}.npz")
     d    = np.load(path, allow_pickle=True)
 
@@ -98,10 +192,12 @@ for traj_i in range(n_traj):
     pcca_o   = d['pcca_order']
     ns       = int(d['n_state'])
     tN       = K.shape[0]
+    if K.shape != (196, 196) or Psi.shape[1] != 196:
+        raise ValueError(f"{path}: expected 196-observable results; regenerate Step 2")
     si       = np.arange(ns)
 
     M    = Psi.shape[0] - 1
-    ntr  = int(0.8 * M)
+    ntr  = validate_training_result(d, len(Psi))
     Xtr  = Psi[:ntr].T
     Ytr  = Psi[1:ntr+1].T
     Xt   = Psi[ntr:-1].T
@@ -118,12 +214,19 @@ for traj_i in range(n_traj):
         'Random': rng.permutation(tN),
     }
 
-    print(f"Trajectory {traj_i+1}/{n_traj}: computing errors...")
-    for nm, o in ords_i.items():
-        e1 = np.array([err1(o, N, Xtr, Ytr, Ytr_si, Xt, Yt_si, ntr) for N in Nr])
-        E1_all[nm].append(e1)
-        em = errM(o, Nms, Psi, si, steps, ntr)
-        EM_all[nm].append(em)
+    if not PLOT_ONLY:
+        print(f"Trajectory {traj_i+1}/{n_traj}: computing errors...")
+        statistics = one_step_statistics(Psi, ntr, si)
+        for nm, o in ords_i.items():
+            e1 = np.array([one_step_from_statistics(o, N, statistics) for N in Nr])
+            E1_all[nm].append(e1)
+            em = errM(o, Nms, Psi, si, steps, ntr)
+            EM_all[nm].append(em)
+        np.savez_compressed(EVALUATION / "trajectory_errors.npz", N=Nr, N_multistep=Nms,
+                            horizons=np.arange(1, steps+1),
+                            **{"E1_"+nm: np.asarray(v) for nm, v in E1_all.items()},
+                            **{"EM_"+nm: np.asarray(v) for nm, v in EM_all.items()})
+        print(f"Trajectory {traj_i+1}/{n_traj}: saved one-step and multi-step errors", flush=True)
 
     # Save representative data from trajectory 0 for heatmap / score figures
     if traj_i == 0:
@@ -146,12 +249,24 @@ E1_std  = {nm: E1_arr[nm].std(axis=0)  for nm in E1_arr}
 EM_mean = {nm: EM_arr[nm].mean(axis=0) for nm in EM_arr}
 EM_std  = {nm: EM_arr[nm].std(axis=0)  for nm in EM_arr}
 
-# Convenience: ratio mean/std
-ratio_mean = {nm: E1_mean[nm] / E1_mean['Random'] for nm in ['PR','PPR','TICA','PCCA+']}
-ratio_std  = {nm: ratio_mean[nm] * np.sqrt(
-                  (E1_std[nm]         / E1_mean[nm]        )**2 +
-                  (E1_std['Random']   / E1_mean['Random']  )**2)
-              for nm in ['PR','PPR','TICA','PCCA+']}
+# Pair methods with Random within each trajectory; retain ratio-of-means separately.
+ratio_mean, ratio_std, ratio_of_means = {}, {}, {}
+for nm in ['PR','PPR','TICA','PCCA+']:
+    ratio_mean[nm], ratio_std[nm], ratio_of_means[nm] = paired_ratio_summary(
+        E1_arr[nm], E1_arr['Random'])
+summary = dict(dictionary_size=196, evaluation_protocol="train_only_v1", n_trajectories=n_traj,
+               N=Nr.tolist(), N_multistep=Nms, horizons=list(range(1, steps+1)), std_ddof=0,
+               metric="Mean summed squared residual of four training-standardized circular observables",
+               one_step_test_pairs=20000, multistep_common_starts=len(Psi)-ntr-steps,
+               ratio_definition="mean/std of per-trajectory method MSE divided by same-trajectory Random MSE",
+               methods={nm: dict(one_step_mean=E1_mean[nm].tolist(), one_step_std=E1_std[nm].tolist(),
+                                 multistep_mean=EM_mean[nm].tolist(), multistep_std=EM_std[nm].tolist(),
+                                 **({} if nm == 'Random' else dict(
+                                     paired_ratio_mean=ratio_mean[nm].tolist(),
+                                     paired_ratio_std=ratio_std[nm].tolist(),
+                                     ratio_of_means=ratio_of_means[nm].tolist()))) for nm in pn})
+if not PLOT_ONLY:
+    (EVALUATION / "evaluation_results.json").write_text(json.dumps(summary, indent=2) + "\n")
 
 print("\nAggregation complete.")
 
@@ -168,8 +283,10 @@ for nm in pn:
                     E1_mean[nm] + E1_std[nm],
                     color=C[nm], alpha=0.15)
 ax.set_xlabel('Sub-dictionary size $N$')
-ax.set_ylabel('One-step state prediction error')
+ax.set_ylabel('One-step state prediction MSE')
 ax.set_title('(a) One-step error (mean ± 1 std, 20 trajectories)')
+ax.set_xlim(4, PLOT_N_MAX)
+ax.set_xticks([n for n in [5,15,30,45,60,75] if n < PLOT_N_MAX] + [PLOT_N_MAX])
 ax.legend(); ax.grid(True, alpha=0.2)
 
 ax = axes[1]
@@ -180,12 +297,12 @@ for nm in pn:
                     EM_mean[nm] + EM_std[nm],
                     color=C[nm], alpha=0.15)
 ax.set_xlabel('Prediction horizon (steps)')
-ax.set_ylabel('State prediction error')
+ax.set_ylabel('State prediction MSE')
 ax.set_title(f'(b) Multi-step error ($N={Nms}$, mean ± 1 std)')
 ax.legend(); ax.grid(True, alpha=0.2)
 
 fig.tight_layout()
-fig.savefig(os.path.join(FIG, "ala2_errors.pdf"), bbox_inches='tight')
+save_figure(fig, "ala2_errors")
 print("Saved ala2_errors.pdf")
 
 # ═══════════════════════════════════════════════════════════════
@@ -207,7 +324,7 @@ for ax, title, o in zip(axes,
     ax.set_title(title)
 fig.colorbar(im, ax=axes[-1], shrink=0.75, pad=0.02, label=r'$\log_{10}|K_{ij}|$')
 fig.tight_layout()
-fig.savefig(os.path.join(FIG, "ala2_heatmaps.pdf"), bbox_inches='tight')
+save_figure(fig, "ala2_heatmaps")
 print("Saved ala2_heatmaps.pdf")
 
 # ═══════════════════════════════════════════════════════════════
@@ -234,13 +351,15 @@ for nm in ['PR','PPR','TICA','PCCA+']:
                     color=C[nm], alpha=0.15)
 ax.axhline(1.0, color='gray', ls=':', lw=0.8)
 ax.set_xlabel('Sub-dictionary size $N$')
-ax.set_ylabel('Error / Random error')
+ax.set_ylabel('Paired error / Random error')
 ax.set_title('(c) Improvement over Random (mean ± 1 std)')
 ax.legend(); ax.grid(True, alpha=0.2)
-ax.set_ylim(0, 1.5)
+ax.set_ylim(bottom=0)
+ax.set_xlim(4, PLOT_N_MAX)
+ax.set_xticks([n for n in [5,15,30,45,60,75] if n < PLOT_N_MAX] + [PLOT_N_MAX])
 
 fig.tight_layout()
-fig.savefig(os.path.join(FIG, "ala2_scores.pdf"), bbox_inches='tight')
+save_figure(fig, "ala2_scores")
 print("Saved ala2_scores.pdf")
 
 # ═══════════════════════════════════════════════════════════════
@@ -322,8 +441,48 @@ ax.bar(tc2.keys(), tc2.values(), color=[bc[k] for k in tc2])
 ax.set_ylabel('Count'); ax.set_title(f'(d) PPR top-{n_top} by type')
 
 fig.tight_layout()
-fig.savefig(os.path.join(FIG, "ala2_landscape.pdf"), bbox_inches='tight')
+save_figure(fig, "ala2_landscape")
 print("Saved ala2_landscape.pdf")
+
+# Combined appendix figure matching the manuscript's five-panel structure.
+fig = plt.figure(figsize=(13, 7))
+grid = GridSpec(2, 3, figure=fig)
+ax = fig.add_subplot(grid[0, 0])
+ax.contourf(PP, QQ, VV, levels=30, cmap='viridis_r')
+if len(rbf_centers):
+    ax.scatter(rbf_centers[:, 0], rbf_centers[:, 1], s=18, c='white',
+               edgecolors='black', linewidths=.6)
+ax.set(xlabel=r'$\phi$', ylabel=r'$\psi$', title=f'(a) Top-{len(rbf_centers)} selected RBF centers',
+       xlim=(-np.pi, np.pi), ylim=(-np.pi, np.pi))
+ax.set_aspect('equal')
+ax = fig.add_subplot(grid[0, 1])
+types = ['Fourier', 'Cross', 'RBF']
+x = np.arange(len(types))
+ax.bar(x-.18, [types_pr.count(t) for t in types], .36, color=C['PR'], label='PR')
+ax.bar(x+.18, [types_ppr.count(t) for t in types], .36, color=C['PPR'], label='PPR')
+ax.set_xticks(x, types)
+ax.set(ylabel='Count', title='(b) Top-20 observable types')
+ax.legend()
+for pos, method, scores, order, label in [
+        (grid[0, 2], 'PR', rep['pi_pr'], rep['pr_o'], '(c) PR scores'),
+        (grid[1, 0], 'PPR', rep['pi_ppr'], rep['ppr_o'], '(d) PPR scores')]:
+    ax = fig.add_subplot(pos)
+    ax.bar(np.arange(rep['tN']), scores[order], width=1, color=C[method])
+    ax.set(xlabel='Observable (rank order)', ylabel='Score', title=label)
+ax = fig.add_subplot(grid[1, 1:])
+for nm in ['PR','PPR','TICA','PCCA+']:
+    ax.plot(Nr, ratio_mean[nm], label=nm, color=C[nm], ls=LS[nm], lw=LW[nm])
+    ax.fill_between(Nr, ratio_mean[nm]-ratio_std[nm], ratio_mean[nm]+ratio_std[nm],
+                    color=C[nm], alpha=.15)
+ax.axhline(1, color='gray', ls=':')
+ax.set(xlabel='Sub-dictionary size $N$', ylabel='Paired error / Random error',
+       title='(e) Mean ± SD of paired trajectory ratios', ylim=(0, None))
+ax.set_xlim(4, PLOT_N_MAX)
+ax.set_xticks([n for n in [5,15,30,45,60,75] if n < PLOT_N_MAX] + [PLOT_N_MAX])
+ax.legend(ncol=4, fontsize=8)
+ax.grid(alpha=.2)
+fig.tight_layout()
+save_figure(fig, 'ala2_macro-scores')
 
 # ═══════════════════════════════════════════════════════════════
 # SUMMARY TABLE
@@ -358,3 +517,11 @@ for nm in ['PR','PPR','TICA','PCCA+']:
     print(f"  {nm:5s} | {' '.join(f'{v:>14s}' for v in vals)}")
 
 print(f"\nFigures saved to {FIG}/")
+
+plot_manifest = dict(plot_only=PLOT_ONLY, evaluation_N_range=[int(Nr[0]), int(Nr[-1])],
+                     displayed_N_range=[4, PLOT_N_MAX], figure_axes_limits=figure_axes_limits,
+                     source_script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                     source_npz_sha256=hashlib.sha256((EVALUATION / "trajectory_errors.npz").read_bytes()).hexdigest(),
+                     source_summary_sha256=hashlib.sha256((EVALUATION / "evaluation_results.json").read_bytes()).hexdigest(),
+                     latex_compiled=False)
+(Path(FIG) / "plot_manifest.json").write_text(json.dumps(plot_manifest, indent=2) + "\n")
