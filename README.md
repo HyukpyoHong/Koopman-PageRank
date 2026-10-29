@@ -25,6 +25,7 @@ Code for the paper:
     ├── 04_02_Ramachandran_edmd_pagerank.py
     ├── 04_03_Ramachandran_evaluate.py
     ├── 04_04_Ramachandran_alpha_sensitivity.py
+    ├── 04_05_Ramachandran_normalization_comparison.py
     ├── 05_lorenz.ipynb
     ├── data/
     ├── results_196_train_only/
@@ -96,6 +97,22 @@ checks against direct prediction. The reported alpha CV is computed within
 each trajectory before aggregation; it is distinct from variation across
 trajectories. Baseline comparison output distinguishes ratios of mean errors
 from means/standard deviations of paired per-trajectory ratios.
+
+To reproduce the appendix row-normalization example and comparison, run:
+
+```bash
+python 04_05_Ramachandran_normalization_comparison.py --toy-only
+python 04_05_Ramachandran_normalization_comparison.py
+```
+
+The first command prints the 3-by-3 example without requiring trajectory data.
+The second reuses Step 2's 20 saved 196-observable, train-only fits and compares
+row-normalized PPR with the globally normalized score at alpha=0.85 and
+N=5,10,20,40. It uses the same four state-coordinate seeds and ridge readout.
+Global normalization divides all weights by the maximum row sum; its scores
+need not sum to one. Per-trajectory errors and mean/std (ddof=0) are saved as
+JSON and CSV under `validation/normalization_comparison_196_train_only/`.
+Use `--results-dir` or `--output-dir` for custom cache or output locations.
 
 Output paths below are relative to `experiments/`:
 
